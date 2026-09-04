@@ -221,6 +221,12 @@ pub struct McpServerConfig {
     /// both are present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
+    /// Per-server reply timeout in seconds for MCP requests (tools/call,
+    /// tools/list, initialize). Defaults to 30 when absent or null. Raise for
+    /// servers whose tools can legitimately take longer than 30s (deep web
+    /// searches, browser fetch/extract). issue #802.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 impl McpServerConfig {
@@ -516,6 +522,7 @@ impl McpConfig {
                             headers: std::collections::HashMap::new(),
                             enabled: None,
                             disabled: None,
+                            timeout_secs: None,
                         },
                     );
                 }

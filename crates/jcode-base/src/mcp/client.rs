@@ -23,6 +23,8 @@ pub struct McpHandle {
     server_info: Arc<std::sync::RwLock<Option<ServerInfo>>>,
     capabilities: Arc<std::sync::RwLock<ServerCapabilities>>,
     tools: Arc<std::sync::RwLock<Vec<McpToolDef>>>,
+    /// Per-server reply timeout applied to every request through this handle.
+    request_timeout: std::time::Duration,
 }
 
 impl McpHandle {
@@ -43,7 +45,7 @@ impl McpHandle {
             .await
             .context("Failed to send request")?;
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        let response = tokio::time::timeout(self.request_timeout, rx)
             .await
             .context("Request timeout")?
             .context("Channel closed")?;
@@ -256,6 +258,7 @@ impl McpClient {
             server_info: Arc::new(std::sync::RwLock::new(None)),
             capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            request_timeout: std::time::Duration::from_secs(config.timeout_secs.unwrap_or(30)),
         };
 
         let mut client = Self { handle, child };
@@ -469,6 +472,7 @@ done
             headers: std::collections::HashMap::new(),
             enabled: None,
             disabled: None,
+            timeout_secs: None,
         }
     }
 
