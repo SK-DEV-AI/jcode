@@ -767,8 +767,108 @@ fn score_and_filter_prioritizes_matching_skill_memories() {
     assert!(ranked[0].1 > ranked[1].1);
 }
 
+fn rerank_entry(content: &str, rrf: f32) -> (MemoryEntry, f32) {
+    (
+        MemoryEntry::new(MemoryCategory::Fact, content).with_embedding(vec![1.0, 0.0]),
+        rrf,
+    )
+}
+
+#[test]
+fn apply_rerank_promotes_scorer_winner_keeping_rrf_scores() {
+    let cands = vec![
+        rerank_entry("coffee brewing temperatures", 0.030),
+        rerank_entry("cargo build profile selfdev", 0.010),
+    ];
+    let out = MemoryManager::apply_rerank(cands, "build profile", 2, &|_q, p| {
+        Some(if p.contains("cargo") { 8.5 } else { -2.0 })
+    });
+    assert_eq!(out.len(), 2);
+    assert!(
+        out[0].0.content.contains("cargo"),
+        "scorer winner must lead"
+    );
+    // Scores stay RRF: only the order changes (downstream filters are
+    // RRF-calibrated, so a CE-logit scale must never leak into them).
+    assert!((out[0].1 - 0.010).abs() < 1e-6);
+    assert!((out[1].1 - 0.030).abs() < 1e-6);
+}
+
+#[test]
+fn apply_rerank_fails_open_to_rrf_order_when_scorer_blind() {
+    let cands = vec![rerank_entry("alpha", 0.030), rerank_entry("beta", 0.020)];
+    let out = MemoryManager::apply_rerank(cands, "q", 2, &|_, _| None);
+    assert_eq!(out[0].0.content, "alpha");
+    assert_eq!(out[1].0.content, "beta");
+}
+
+#[test]
+fn apply_rerank_trails_partially_scored_behind_in_rrf_order() {
+    let cands = vec![
+        rerank_entry("unscored one", 0.030),
+        rerank_entry("winner cargo", 0.010),
+        rerank_entry("unscored two", 0.005),
+    ];
+    let out = MemoryManager::apply_rerank(cands, "cargo", 3, &|_, p| {
+        if p.contains("winner") {
+            Some(9.0)
+        } else {
+            None
+        }
+    });
+    assert!(out[0].0.content.contains("winner"));
+    assert_eq!(out[1].0.content, "unscored one");
+    assert_eq!(out[2].0.content, "unscored two");
+}
+
+#[test]
+fn apply_rerank_respects_take_and_breaks_ties_by_rrf_order() {
+    let cands = vec![rerank_entry("a", 0.3), rerank_entry("b", 0.2)];
+    let out = MemoryManager::apply_rerank(cands, "q", 1, &|_, _| Some(1.0));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0.content, "a", "tied scores stay in RRF order");
+    let out: Vec<(MemoryEntry, f32)> =
+        MemoryManager::apply_rerank(vec![], "q", 5, &|_, _| Some(1.0));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn hybrid_fuse_rerank_path_preserves_lexical_rescue_if_present() {
+    // End-to-end through hybrid_fuse with a real cross-encoder when the
+    // artifact exists; skipped otherwise (same convention as the
+    // cross-encoder crate test). Assertion holds on both paths: RRF-only
+    // rescues via BM25 (proven by the test below), a live CE must agree.
+    let dir = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".jcode/models/ce-minilm-l6"))
+        .filter(|d| d.join("model.onnx").exists() && d.join("tokenizer.json").exists());
+    if dir.is_none() {
+        eprintln!("skip: cross-encoder artifact not present locally");
+        return;
+    }
+    let target = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "The function find_similar_hybrid fuses dense and bm25 with RRF.",
+    )
+    .with_embedding(vec![0.0, 1.0]);
+    let distractor = MemoryEntry::new(MemoryCategory::Fact, "Unrelated coffee note.")
+        .with_embedding(vec![1.0, 0.0]);
+    let ranked = MemoryManager::hybrid_fuse(
+        vec![target.clone(), distractor],
+        "how does find_similar_hybrid work",
+        &[1.0, 0.0],
+        2,
+    );
+    assert!(!ranked.is_empty());
+    assert_eq!(ranked[0].0.id, target.id);
+}
+
 #[test]
 fn hybrid_fuse_rescues_lexical_match_dense_would_miss() {
+    // RRF-only hermeticity: the rerank gate is forced off so this test pins
+    // the fusion behavior even on machines carrying the CE artifact.
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_MEMORY_RERANKING_ENABLED");
+    crate::env::set_var("JCODE_MEMORY_RERANKING_ENABLED", "false");
     // A memory that is the obvious lexical answer (shares the rare identifier
     // `find_similar_hybrid`) but is given a deliberately ORTHOGONAL embedding so
     // pure dense cosine ranks it last. BM25 must rescue it into the top result.
@@ -806,10 +906,17 @@ fn hybrid_fuse_rescues_lexical_match_dense_would_miss() {
         ranked[0].0.id, target.id,
         "BM25 should rescue the exact-identifier memory to the top despite poor dense score"
     );
+    match prev {
+        Some(value) => crate::env::set_var("JCODE_MEMORY_RERANKING_ENABLED", value),
+        None => crate::env::remove_var("JCODE_MEMORY_RERANKING_ENABLED"),
+    }
 }
 
 #[test]
 fn hybrid_fuse_returns_dense_hits_without_lexical_overlap() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_MEMORY_RERANKING_ENABLED");
+    crate::env::set_var("JCODE_MEMORY_RERANKING_ENABLED", "false");
     // When the query shares NO tokens with any memory, hybrid must still return
     // the dense-nearest memory (fusion falls back to the dense ranking).
     let near = MemoryEntry::new(MemoryCategory::Fact, "alpha bravo charlie")
@@ -829,6 +936,10 @@ fn hybrid_fuse_returns_dense_hits_without_lexical_overlap() {
         ranked[0].0.id, near.id,
         "dense-nearest memory should rank first"
     );
+    match prev {
+        Some(value) => crate::env::set_var("JCODE_MEMORY_RERANKING_ENABLED", value),
+        None => crate::env::remove_var("JCODE_MEMORY_RERANKING_ENABLED"),
+    }
 }
 
 #[test]

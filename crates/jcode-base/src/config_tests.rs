@@ -438,6 +438,28 @@ fn test_memory_sidecar_enabled_defaults_true() {
 }
 
 #[test]
+fn test_memory_reranking_enabled_defaults_true() {
+    // Rerank defaults on because it is free when unconfigured: with no
+    // cross-encoder artifact on disk the recall path stays RRF-only.
+    let cfg = Config::default();
+    assert!(cfg.agents.memory_reranking_enabled);
+}
+
+#[test]
+fn test_env_override_memory_reranking() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_MEMORY_RERANKING_ENABLED");
+    crate::env::set_var("JCODE_MEMORY_RERANKING_ENABLED", "false");
+
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+
+    assert!(!cfg.agents.memory_reranking_enabled);
+
+    restore_env_var("JCODE_MEMORY_RERANKING_ENABLED", prev);
+}
+
+#[test]
 fn test_env_override_memory_sidecar() {
     let _guard = crate::storage::lock_test_env();
     let prev_model = std::env::var_os("JCODE_MEMORY_MODEL");

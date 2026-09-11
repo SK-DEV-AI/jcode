@@ -417,6 +417,11 @@ impl Config {
                 self.agents.memory_sidecar_enabled = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_RERANKING_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_reranking_enabled = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_BACKEND") {
             let trimmed = v.trim();
             if !trimmed.is_empty() {

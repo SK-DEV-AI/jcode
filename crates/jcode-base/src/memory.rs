@@ -19,6 +19,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[path = "memory/activity.rs"]
@@ -120,6 +122,16 @@ pub type MemoryEventSink = Arc<dyn Fn(crate::protocol::ServerEvent) + Send + Syn
 /// the no-LLM hybrid path (`agents.memory_sidecar_enabled = false`).
 pub fn memory_sidecar_enabled() -> bool {
     crate::config::config().agents.memory_sidecar_enabled
+}
+
+/// Whether the deterministic cross-encoder rerank applies to the hybrid
+/// recall pool. This is the *configured* intent; the artifact must also be
+/// present on disk (see `maybe_cross_encoder`). Defaults to `true`: with no
+/// artifact it is a silent RRF-only no-op, so the default costs nothing
+/// unconfigured. Opt out with `agents.memory_reranking_enabled = false`
+/// (env `JCODE_MEMORY_RERANKING_ENABLED`).
+pub fn memory_reranking_enabled() -> bool {
+    crate::config::config().agents.memory_reranking_enabled
 }
 
 /// Whether the LLM precision-judge (sidecar) path can actually run right now:
@@ -664,6 +676,83 @@ impl MemoryManager {
         ))
     }
 
+    /// Max fused candidates rescored by the cross-encoder. 20 pairs x ~6 ms
+    /// tract CPU ~= ~120 ms on the recall path (not the streaming hot loop).
+    const RERANK_POOL: usize = 20;
+
+    /// Lazily loaded cross-encoder (`~/.jcode/models/ce-minilm-l6/` holding
+    /// `model.onnx` + `tokenizer.json`, same layout as the MiniLM embedder).
+    /// `None` when the artifact is absent or fails to load: rerank silently
+    /// degrades to RRF-only (fail-open, never fatal). Load failure is sticky
+    /// with a one-time log so a broken artifact cannot spam every recall.
+    fn maybe_cross_encoder() -> Option<&'static crate::embedding::CrossEncoder> {
+        static CE: OnceLock<Option<crate::embedding::CrossEncoder>> = OnceLock::new();
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        let ce = CE.get_or_init(|| {
+            let dir = crate::storage::jcode_dir()
+                .ok()
+                .map(|d| d.join("models").join("ce-minilm-l6"));
+            let dir = dir.filter(|d| {
+                d.join("model.onnx").exists() && d.join("tokenizer.json").exists()
+            });
+            match dir {
+                Some(d) => match crate::embedding::CrossEncoder::load_from_dir(&d) {
+                    Ok(ce) => Some(ce),
+                    Err(e) => {
+                        crate::logging::warn(&format!(
+                            "cross-encoder artifact present but unloadable ({}); recall stays RRF-only",
+                            e
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            }
+        });
+        if ce.is_none() && !LOGGED.swap(true, Ordering::Relaxed) && memory_reranking_enabled() {
+            crate::logging::info(
+                "cross-encoder rerank enabled but no artifact at ~/.jcode/models/ce-minilm-l6/; recall stays RRF-only",
+            );
+        }
+        ce.as_ref()
+    }
+
+    /// Reorder RRF-fused `cands` by `scorer`, returning the top `take`.
+    /// Returned scores stay RRF: only the ORDER changes, so downstream
+    /// filters (gap filter, thresholds) calibrated on RRF behave exactly as
+    /// before. Candidates the scorer rejects (`None`) trail behind all scored
+    /// ones in their original RRF order; zero scored candidates = pure
+    /// fail-open (input order truncated to `take`). RRF-index tiebreak keeps
+    /// equal scores deterministic.
+    fn apply_rerank(
+        cands: Vec<(MemoryEntry, f32)>,
+        query: &str,
+        take: usize,
+        scorer: &dyn Fn(&str, &str) -> Option<f32>,
+    ) -> Vec<(MemoryEntry, f32)> {
+        if cands.is_empty() || take == 0 {
+            return cands.into_iter().take(take).collect();
+        }
+        let mut rows: Vec<(usize, MemoryEntry, f32, Option<f32>)> = cands
+            .into_iter()
+            .enumerate()
+            .map(|(i, (e, rrf))| {
+                let ce = scorer(query, &e.content);
+                (i, e, rrf, ce)
+            })
+            .collect();
+        rows.sort_by(|a, b| match (&a.3, &b.3) {
+            (Some(x), Some(y)) => y.total_cmp(x).then_with(|| a.0.cmp(&b.0)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)),
+        });
+        rows.into_iter()
+            .take(take)
+            .map(|(_, e, rrf, _)| (e, rrf))
+            .collect()
+    }
+
     /// Pull pool, rank by dense and BM25 separately, fuse with RRF.
     fn hybrid_fuse(
         entries: Vec<MemoryEntry>,
@@ -719,12 +808,20 @@ impl MemoryManager {
         }
 
         let mut entries: Vec<Option<MemoryEntry>> = entries.into_iter().map(Some).collect();
-        top_k_by_score(
-            fused
-                .into_iter()
-                .filter_map(|(idx, score)| entries[idx].take().map(|e| (e, score))),
-            limit,
-        )
+        let fused_vec: Vec<(MemoryEntry, f32)> = fused
+            .into_iter()
+            .filter_map(|(idx, score)| entries[idx].take().map(|e| (e, score)))
+            .collect();
+        // Deterministic cross-encoder precision pass over the fused pool.
+        // Scores stay RRF (only the order changes); absent artifact, disabled
+        // gate, or scorer failure all degrade to plain RRF top-`limit`.
+        if memory_reranking_enabled()
+            && let Some(ce) = Self::maybe_cross_encoder()
+        {
+            let pool = top_k_by_score(fused_vec, Self::RERANK_POOL);
+            return Self::apply_rerank(pool, query_text, limit, &|q, p| ce.score(q, p).ok());
+        }
+        top_k_by_score(fused_vec, limit)
     }
 
     fn collect_all_memories_with_embeddings(&self) -> Result<Vec<MemoryEntry>> {
