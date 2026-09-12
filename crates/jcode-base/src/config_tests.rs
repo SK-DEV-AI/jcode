@@ -438,11 +438,13 @@ fn test_memory_sidecar_enabled_defaults_true() {
 }
 
 #[test]
-fn test_memory_reranking_enabled_defaults_true() {
-    // Rerank defaults on because it is free when unconfigured: with no
-    // cross-encoder artifact on disk the recall path stays RRF-only.
+fn test_memory_reranking_enabled_defaults_false() {
+    // Rerank defaults OFF: upstream measured a local cross-encoder over the
+    // noisy window and rejected it (recall@5 0.325 vs hybrid 0.530). The
+    // focused-query variant this path uses is unmeasured, so it never runs
+    // without an explicit opt-in.
     let cfg = Config::default();
-    assert!(cfg.agents.memory_reranking_enabled);
+    assert!(!cfg.agents.memory_reranking_enabled);
 }
 
 #[test]

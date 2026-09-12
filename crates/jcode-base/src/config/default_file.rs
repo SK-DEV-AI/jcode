@@ -470,12 +470,15 @@ swarm_max_concurrent_agents = 32
 # dormant instead of degrading to the no-LLM path. Env: JCODE_MEMORY_SIDECAR_ENABLED
 # memory_sidecar_enabled = true
 #
-# Deterministic cross-encoder rerank of the hybrid recall pool (local
-# ms-marco-MiniLM-L-6-v2, 22M). Rescores the top-20 fused candidates before
-# the LLM judges see them. Only active when ~/.jcode/models/ce-minilm-l6/
-# holds model.onnx + tokenizer.json; otherwise silently RRF-only.
+# EXPERIMENTAL cross-encoder rerank of the hybrid recall pool (local
+# ms-marco-MiniLM-L-6-v2, 22M), scored against the focused query. Upstream
+# measured a local CE over the noisy window and REJECTED it (recall@5 0.325
+# vs hybrid 0.530, docs/plans/MEMORY_GRAPH_PLAN.md); the focused-query variant
+# is unmeasured. Leave off until memory_recall_bench scores it above hybrid.
+# Only active when ~/.jcode/models/ce-minilm-l6/ holds model.onnx +
+# tokenizer.json; otherwise silently RRF-only. Default false.
 # Env: JCODE_MEMORY_RERANKING_ENABLED
-# memory_reranking_enabled = true
+# memory_reranking_enabled = false
 #
 # Minimum turns between Mode-2 memory reranks (cadence floor). The expensive
 # listwise LLM rerank runs at most once per this many turns; skipped turns fall

@@ -620,13 +620,20 @@ pub struct AgentsConfig {
     /// Deterministic cross-encoder rerank of the hybrid-fused recall pool
     /// (`cross-encoder/ms-marco-MiniLM-L-6-v2`, 22M, local tract runtime,
     /// Apache-2.0). After BM25+dense RRF fusion, the top-20 candidates are
-    /// rescored jointly against the query and the top-`limit` by rerank
-    /// score win. Precision layer *before* the Mode-2 LLM judges: fewer
-    /// irrelevant candidates reach the expensive judge. Only active when
-    /// the artifact is present at `~/.jcode/models/ce-minilm-l6/`
-    /// (`model.onnx` + `tokenizer.json`); an absent artifact is a silent
-    /// RRF-only fallback, so this defaults to `true` at zero cost when
-    /// unconfigured. Env override: `JCODE_MEMORY_RERANKING_ENABLED`.
+    /// rescored jointly against the FOCUSED query and the top-`limit` by
+    /// rerank score win.
+    ///
+    /// Defaults to `false` and is EXPERIMENTAL. Upstream previously measured a
+    /// local cross-encoder over the noisy retrieval window and REJECTED it
+    /// (`docs/plans/MEMORY_GRAPH_PLAN.md`: recall@5 0.325 vs hybrid 0.530;
+    /// `memory_rerank.rs`: "out-of-domain for memory statements, and it chokes
+    /// on noisy multi-message context"). The bench's `ce_rerank_focused`
+    /// variant (clean query) was added but never scored, so the delta is
+    /// unmeasured. Do not enable in production until it is benchmarked against
+    /// `hybrid` in `memory_recall_bench`. Only active when the artifact is
+    /// present at `~/.jcode/models/ce-minilm-l6/` (`model.onnx` +
+    /// `tokenizer.json`); an absent artifact is a silent RRF-only fallback.
+    /// Env override: `JCODE_MEMORY_RERANKING_ENABLED`.
     #[serde(default = "default_memory_reranking_enabled")]
     pub memory_reranking_enabled: bool,
     /// Maximum number of live swarm worker agents in one swarm. This is the RAM
@@ -652,7 +659,7 @@ fn default_memory_sidecar_enabled() -> bool {
 }
 
 fn default_memory_reranking_enabled() -> bool {
-    true
+    false
 }
 
 fn default_memory_rerank_cadence() -> usize {
