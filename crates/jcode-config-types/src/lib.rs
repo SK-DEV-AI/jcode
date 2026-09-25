@@ -435,6 +435,14 @@ pub struct CompactionConfig {
     /// Max milliseconds to wait for the summary command before failing open
     /// to the built-in summarizer (default: 120000).
     pub summary_command_timeout_ms: u64,
+    /// Proactive tool-result clearing: when set to N, tool results older than
+    /// the last N provider-bound messages are stubbed at send time
+    /// (`[cleared by retention: was N chars]`). The ToolUse blocks (name +
+    /// input) and result IDs are always kept, so provider tool-pairing never
+    /// breaks; results under 200 chars are left alone. The session file is
+    /// never modified — clearing applies to the send view only, so a later
+    /// compaction still summarizes the full history. Off when unset.
+    pub clear_tool_results_older_than: Option<usize>,
 }
 
 impl Default for CompactionConfig {
@@ -453,6 +461,7 @@ impl Default for CompactionConfig {
             max_context_tokens: 0,
             summary_command: None,
             summary_command_timeout_ms: 120_000,
+            clear_tool_results_older_than: None,
         }
     }
 }
