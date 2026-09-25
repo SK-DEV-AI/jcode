@@ -36,6 +36,10 @@ itself maintains:
 - **Lifecycle**: start a session by reading `PROGRESS.md` plus `git log`;
   end mergeable-clean with the file updated. One file, one project — never
   global (progress belongs to exactly one project).
+- **Keep it tight**: the whole file loads into every session's bootstrap, so
+  prune ruthlessly — current state + next steps, not history. Move detail to
+  the session transcript (it stays on disk); the progress file is a pointer
+  to resume, not an archive.
 
 ## Adding guidance (most common)
 
