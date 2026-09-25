@@ -1111,6 +1111,32 @@ pub fn citation_stale_mark(
     }
 }
 
+/// Advisory age hedge for a recalled memory, or `None` when fresh.
+///
+/// Memories older than [`AGE_HEDGE_DAYS`] render with their recorded age so
+/// the model treats them as possibly outdated and re-verifies against current
+/// code before asserting them as fact. Cited memories are exempt: their
+/// freshness is already covered by [`citation_stale_mark`], which says
+/// something stronger (the source changed, not merely that time passed).
+/// Deterministic in whole days so canonical re-renders within the same day
+/// stay byte-identical for the pending-publication comparison.
+pub const AGE_HEDGE_DAYS: i64 = 14;
+
+pub fn age_hedge_mark(entry: &MemoryEntry) -> Option<String> {
+    if entry.citation.is_some() {
+        return None;
+    }
+    let age_days = (Utc::now() - entry.updated_at).num_days();
+    if age_days >= AGE_HEDGE_DAYS {
+        Some(format!(
+            "  (recorded {} days ago — verify against current code before asserting as fact)",
+            age_days
+        ))
+    } else {
+        None
+    }
+}
+
 fn format_entries_for_prompt_with_header(
     entries: &[MemoryEntry],
     limit: usize,
@@ -1148,6 +1174,9 @@ fn format_entries_for_prompt_with_header(
             output.push_str(&format!("{}. {}\n", idx + 1, item.content.trim()));
             if let Some(mark) = citation_stale_mark(item, repo_root) {
                 output.push_str(&mark);
+                output.push('\n');
+            } else if let Some(hedge) = age_hedge_mark(item) {
+                output.push_str(&hedge);
                 output.push('\n');
             }
             if include_updated_at_comments {
@@ -1441,10 +1470,12 @@ pub mod ranking {
     mod tests {
         use super::*;
         use crate::{
-            CitationStatus, MemoryCategory, MemoryEntry, SourceCitation, citation_stale_mark,
-            find_repo_root, format_relevant_prompt, format_relevant_prompt_verified, git_head_for,
-            is_foreign_checkout, strip_url_credentials,
+            AGE_HEDGE_DAYS, CitationStatus, MemoryCategory, MemoryEntry, SourceCitation,
+            age_hedge_mark, citation_stale_mark, find_repo_root, format_relevant_prompt,
+            format_relevant_prompt_verified, git_head_for, is_foreign_checkout,
+            strip_url_credentials,
         };
+        use chrono::{Duration, Utc};
 
         #[test]
         fn top_k_by_score_keeps_highest_scores_in_order() {
@@ -1532,6 +1563,50 @@ pub mod ranking {
                 entry.citation.as_ref().unwrap().verify(dir.path()),
                 CitationStatus::Stale
             );
+        }
+
+        #[test]
+        fn age_hedge_silent_on_fresh_uncited_memory() {
+            let entry = MemoryEntry::new(MemoryCategory::Fact, "fresh fact");
+            assert_eq!(age_hedge_mark(&entry), None);
+            let prompt = format_relevant_prompt(std::slice::from_ref(&entry), 1).unwrap();
+            assert!(!prompt.contains("recorded"), "prompt was: {prompt}");
+        }
+
+        #[test]
+        fn age_hedge_marks_old_uncited_memory() {
+            let old = Utc::now() - Duration::days(20);
+            let entry =
+                MemoryEntry::new(MemoryCategory::Fact, "old fact").with_timestamps(old, old);
+            let mark = age_hedge_mark(&entry).expect("hedge for 20-day-old memory");
+            assert!(mark.contains("recorded 20 days ago"), "mark was: {mark}");
+            let prompt = format_relevant_prompt(std::slice::from_ref(&entry), 1).unwrap();
+            assert!(
+                prompt.contains("recorded 20 days ago"),
+                "prompt was: {prompt}"
+            );
+        }
+
+        #[test]
+        fn age_hedge_boundary_day() {
+            let boundary = Utc::now() - Duration::days(AGE_HEDGE_DAYS);
+            let at = MemoryEntry::new(MemoryCategory::Fact, "boundary fact")
+                .with_timestamps(boundary, boundary);
+            assert!(age_hedge_mark(&at).is_some());
+            let just_under = Utc::now() - Duration::days(AGE_HEDGE_DAYS) + Duration::hours(1);
+            let under = MemoryEntry::new(MemoryCategory::Fact, "young fact")
+                .with_timestamps(just_under, just_under);
+            assert_eq!(age_hedge_mark(&under), None);
+        }
+
+        #[test]
+        fn age_hedge_skips_cited_memory() {
+            // Cited memories answer to citation_stale_mark instead: a stale
+            // citation says something stronger than an age hedge.
+            let old = Utc::now() - Duration::days(60);
+            let mut entry = cited_entry("a.rs", 1, 4, SAMPLE);
+            entry.updated_at = old;
+            assert_eq!(age_hedge_mark(&entry), None);
         }
 
         #[test]
