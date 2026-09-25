@@ -489,6 +489,13 @@ swarm_max_concurrent_agents = 32
 # Legacy memory_rerank_* and memory_embedding_* settings are accepted for
 # backwards compatibility, but have no effect on Jev recall.
 #
+# RRF k for hybrid (BM25 + dense) fusion: shared by manual hybrid recall,
+# the recall bench, and the public find_similar_hybrid API. (Jev auto-recall
+# does not fuse this way.) k=60 suits thousand-item corpora; memory stores
+# are far smaller, so 10-30 separates top ranks better there. Default 60.
+# Env override: JCODE_MEMORY_RRF_K (wins over file).
+# memory_rrf_k = 60.0
+#
 # Opt-in structural repo map (repomap tool): ranked files with symbol stubs
 # (kind name:line), no bodies, truncated at this many estimated tokens.
 # 0 disables the map entirely (the tool is not registered). Default 0.
@@ -632,6 +639,7 @@ swarm_max_concurrent_agents = 32
 # JCODE_HOOK_TRIGGER (critical/context_limit), JCODE_HOOK_MODE,
 # JCODE_HOOK_MESSAGES_DROPPED, JCODE_HOOK_USAGE_PCT.
 # compaction_emergency = ""
+#
 # Transform hook before each provider request. Receives the full request
 # (messages, tools, system_static, system_dynamic) as JSON on stdin; stdout
 # may carry a rewritten request in the same shape. Exit 0 applies stdout

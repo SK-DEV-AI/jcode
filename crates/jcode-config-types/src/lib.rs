@@ -660,6 +660,14 @@ pub struct AgentsConfig {
     /// Legacy setting, retained for config compatibility. Jev recall ignores it.
     #[serde(default = "default_memory_rerank_min_agree")]
     pub memory_rerank_min_agree: usize,
+    /// RRF k for hybrid (BM25 + dense) fusion in recall. Higher k compresses
+    /// rank gaps (flatter fusion), lower k rewards top ranks more steeply.
+    /// k=60 is tuned for thousand-item corpora; memory stores are far
+    /// smaller, so operators with tens of memories may prefer 10-30 for
+    /// sharper top-rank separation. Clamped to [1.0, 1000.0] at use.
+    /// Env override: `JCODE_MEMORY_RRF_K` (wins over file).
+    #[serde(default = "default_memory_rrf_k")]
+    pub memory_rrf_k: f32,
     /// Legacy benchmark/debug embedding backend. Jev recall never uses it.
     /// Token budget for the opt-in structural repo map (`repomap` tool).
     /// Ranked symbol stubs without bodies, truncated at this many estimated
@@ -724,6 +732,9 @@ fn default_memory_rerank_min_agree() -> usize {
     2
 }
 
+fn default_memory_rrf_k() -> f32 {
+    60.0
+}
 fn default_repomap_token_budget() -> usize {
     // Default-off: the map is opt-in (see #1230). A nonzero budget (file
     // or JCODE_REPOMAP_TOKEN_BUDGET) registers the tool.
@@ -747,6 +758,7 @@ impl Default for AgentsConfig {
             memory_rerank_cadence: default_memory_rerank_cadence(),
             memory_rerank_votes: default_memory_rerank_votes(),
             memory_rerank_min_agree: default_memory_rerank_min_agree(),
+            memory_rrf_k: default_memory_rrf_k(),
             repomap_token_budget: default_repomap_token_budget(),
             memory_embedding_backend: default_memory_embedding_backend(),
             memory_embedding_model: None,
