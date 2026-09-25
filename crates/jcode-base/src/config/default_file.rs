@@ -627,6 +627,16 @@ swarm_max_concurrent_agents = 32
 # JCODE_HOOK_TRIGGER (critical/context_limit), JCODE_HOOK_MODE,
 # JCODE_HOOK_MESSAGES_DROPPED, JCODE_HOOK_USAGE_PCT.
 # compaction_emergency = ""
+#
+# Transform hook before each provider request. Receives the full request
+# (messages, tools, system_static, system_dynamic) as JSON on stdin; stdout
+# may carry a rewritten request in the same shape. Exit 0 applies stdout
+# (empty stdout = unchanged); any other outcome fails open with the
+# original request.
+# pre_request = ""
+#
+# Max milliseconds to wait for pre_request before failing open (default: 5000).
+# pre_request_timeout_ms = 5000
 
 [ambient]
 # Ambient mode: background agent that maintains your codebase
