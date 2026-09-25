@@ -436,12 +436,16 @@ pub struct CompactionConfig {
     /// to the built-in summarizer (default: 120000).
     pub summary_command_timeout_ms: u64,
     /// Proactive tool-result clearing: when set to N, tool results older than
-    /// the last N provider-bound messages are stubbed at send time
-    /// (`[cleared by retention: was N chars]`). The ToolUse blocks (name +
-    /// input) and result IDs are always kept, so provider tool-pairing never
-    /// breaks; results under 200 chars are left alone. The session file is
-    /// never modified — clearing applies to the send view only, so a later
-    /// compaction still summarizes the full history. Off when unset.
+    /// the last N provider-bound messages are offloaded at send time to a
+    /// session-scoped file (`<jcode_dir>/sessions/offloaded/...`), substituted
+    /// with the file path plus a first-10-lines preview so the model can
+    /// re-read the full result with existing tools. When the offload write
+    /// fails, falls back to the lossy `[cleared by retention: was N chars]`
+    /// stub. The ToolUse blocks (name + input) and result IDs are always kept,
+    /// so provider tool-pairing never breaks; results under 200 chars are left
+    /// alone. The session file is never modified — clearing applies to the
+    /// send view only, so a later compaction still summarizes the full
+    /// history. Off when unset.
     pub clear_tool_results_older_than: Option<usize>,
 }
 

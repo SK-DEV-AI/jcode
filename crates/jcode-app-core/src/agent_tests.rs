@@ -284,8 +284,25 @@ fn tool_result_clearing_is_off_by_default() {
         timestamp: None,
         tool_duration_ms: None,
     }];
-    let out = Agent::apply_tool_result_clearing(messages.clone());
+    // Sandbox the home dir: off-by-default must not create anything on disk.
+    // (Lock alone does not redirect JCODE_HOME, and asserting on the real
+    // home would turn fragile the moment a live session offloads there.)
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::config::Config::invalidate_cache();
+    let out = Agent::apply_tool_result_clearing(messages.clone(), "session_test_off");
     assert_eq!(format!("{out:?}"), format!("{messages:?}"));
+    assert!(
+        !temp.path().join("sessions").join("offloaded").exists(),
+        "no offload dir may be created while unconfigured"
+    );
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    crate::config::Config::invalidate_cache();
 }
 
 #[test]
@@ -293,6 +310,10 @@ fn tool_result_clearing_stubs_old_keeps_recent_and_pairing() {
     let _guard = crate::storage::lock_test_env();
     let prev = std::env::var_os("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN");
     crate::env::set_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN", "2");
+    // Sandbox the home: a cleared 5000-char result now writes an offload file.
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
     crate::config::Config::invalidate_cache();
 
     let big_old = "o".repeat(5000);
@@ -314,7 +335,7 @@ fn tool_result_clearing_stubs_old_keeps_recent_and_pairing() {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call_old".to_string(),
-                content: big_old,
+                content: big_old.clone(),
                 is_error: None,
             }],
             timestamp: None,
@@ -340,8 +361,8 @@ fn tool_result_clearing_stubs_old_keeps_recent_and_pairing() {
             tool_duration_ms: None,
         },
     ];
-    let out = Agent::apply_tool_result_clearing(messages);
-    // Index 1 is older than the last 2: stubbed, but the id survives.
+    let out = Agent::apply_tool_result_clearing(messages, "session_pairing_test");
+    // Index 1 is older than the last 2: offloaded, but the id survives.
     match &out[1].content[0] {
         ContentBlock::ToolResult {
             tool_use_id,
@@ -350,12 +371,32 @@ fn tool_result_clearing_stubs_old_keeps_recent_and_pairing() {
         } => {
             assert_eq!(tool_use_id, "call_old");
             assert!(
-                content.starts_with("[cleared by retention: was 5000 chars]"),
+                content.starts_with("[offloaded by retention: was 5000 chars;"),
                 "got: {content}"
             );
+            assert!(content.contains("full result at"), "got: {content}");
+            assert!(content.contains(&"o".repeat(10)), "got: {content}");
         }
         other => panic!("result block must survive, got: {other:?}"),
     }
+    // The offloaded file holds the FULL original bytes under a header.
+    let offload_dir = temp
+        .path()
+        .join("sessions")
+        .join("offloaded")
+        .join(Agent::sanitize_offload_component("session_pairing_test"));
+    let entries: Vec<_> = std::fs::read_dir(&offload_dir)
+        .expect("offload dir")
+        .collect();
+    assert_eq!(entries.len(), 1, "one file per cleared result");
+    let body =
+        std::fs::read_to_string(entries[0].as_ref().expect("entry").path()).expect("read offload");
+    assert!(
+        body.contains("tool: read"),
+        "header names the tool:\n{body}"
+    );
+    assert!(body.contains("tool_use_id: call_old"), "header:\n{body}");
+    assert!(body.contains(&big_old), "full original bytes preserved");
     // ToolUse intent untouched.
     assert!(matches!(out[0].content[0], ContentBlock::ToolUse { .. }));
     // Recent result untouched.
@@ -363,7 +404,26 @@ fn tool_result_clearing_stubs_old_keeps_recent_and_pairing() {
         ContentBlock::ToolResult { content, .. } => assert_eq!(content, &big_recent),
         other => panic!("recent result must survive, got: {other:?}"),
     }
+    // Byte-identical rewrite: a second pass over the SAME content changes
+    // nothing (guarded by the already-substituted prefix check + no timestamps).
+    let body_before = body.clone();
+    let out2 = Agent::apply_tool_result_clearing(out, "session_pairing_test");
+    match &out2[1].content[0] {
+        ContentBlock::ToolResult { content, .. } => assert!(
+            content.starts_with("[offloaded by retention: was 5000 chars;"),
+            "got: {content}"
+        ),
+        other => panic!("result block must survive, got: {other:?}"),
+    }
+    let body_after =
+        std::fs::read_to_string(entries[0].as_ref().expect("entry").path()).expect("read offload");
+    assert_eq!(body_before, body_after, "rewrites must be byte-identical");
 
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
     match prev {
         Some(value) => crate::env::set_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN", value),
         None => crate::env::remove_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN"),
@@ -371,7 +431,6 @@ fn tool_result_clearing_stubs_old_keeps_recent_and_pairing() {
     crate::config::Config::invalidate_cache();
 }
 
-#[test]
 #[test]
 fn tool_result_clearing_stubs_sibling_images_past_cutoff() {
     use crate::message::{ContentBlock, Message, Role};
@@ -410,7 +469,7 @@ fn tool_result_clearing_stubs_sibling_images_past_cutoff() {
     cfg.compaction.clear_tool_results_older_than = Some(1);
     cfg.save().expect("save config");
     crate::config::Config::invalidate_cache();
-    let out = Agent::apply_tool_result_clearing(vec![old_msg, recent_msg]);
+    let out = Agent::apply_tool_result_clearing(vec![old_msg, recent_msg], "session_img_test");
     // Old text kept (tiny), old image stubbed with pairing ID intact.
     match &out[0].content[0] {
         ContentBlock::ToolResult {
@@ -478,7 +537,7 @@ fn tool_result_clearing_keeps_user_uploaded_images() {
     cfg.compaction.clear_tool_results_older_than = Some(1);
     cfg.save().expect("save config");
     crate::config::Config::invalidate_cache();
-    let out = Agent::apply_tool_result_clearing(vec![upload, recent]);
+    let out = Agent::apply_tool_result_clearing(vec![upload, recent], "session_upload_test");
     assert!(matches!(&out[0].content[1], ContentBlock::Image { .. }));
     if let ContentBlock::Image { data, .. } = &out[0].content[1] {
         assert_eq!(data.len(), 200_000);
@@ -491,10 +550,15 @@ fn tool_result_clearing_keeps_user_uploaded_images() {
     crate::config::Config::invalidate_cache();
 }
 
+#[test]
 fn tool_result_clearing_keeps_small_results() {
     let _guard = crate::storage::lock_test_env();
     let prev = std::env::var_os("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN");
     crate::env::set_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN", "0");
+    // Sandbox the home (pattern hygiene; small results never touch disk).
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
     crate::config::Config::invalidate_cache();
 
     let small = "ok".to_string();
@@ -508,12 +572,21 @@ fn tool_result_clearing_keeps_small_results() {
         timestamp: None,
         tool_duration_ms: None,
     }];
-    let out = Agent::apply_tool_result_clearing(messages);
+    let out = Agent::apply_tool_result_clearing(messages, "session_small_test");
     match &out[0].content[0] {
         ContentBlock::ToolResult { content, .. } => assert_eq!(content, &small),
         other => panic!("small result must survive, got: {other:?}"),
     }
+    assert!(
+        !temp.path().join("sessions").join("offloaded").exists(),
+        "small results must not create offload files"
+    );
 
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
     match prev {
         Some(value) => crate::env::set_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN", value),
         None => crate::env::remove_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN"),
@@ -526,6 +599,10 @@ fn tool_result_clearing_counts_characters_not_bytes() {
     let _guard = crate::storage::lock_test_env();
     let prev = std::env::var_os("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN");
     crate::env::set_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN", "0");
+    // Sandbox the home: the 300-char CJK result now writes an offload file.
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
     crate::config::Config::invalidate_cache();
 
     // 100 CJK chars = 300 bytes: under the 200-char policy, must survive.
@@ -544,12 +621,12 @@ fn tool_result_clearing_counts_characters_not_bytes() {
     // keep=0 with a single message: len 1 <= keep... use keep path via two
     // messages so index 0 clears-or-keeps by size only.
     let two = vec![messages[0].clone(), messages[0].clone()];
-    let out = Agent::apply_tool_result_clearing(two);
+    let out = Agent::apply_tool_result_clearing(two, "session_cjk_test");
     match &out[0].content[0] {
         ContentBlock::ToolResult { content, .. } => assert_eq!(content, &cjk),
         other => panic!("CJK result under policy must survive, got: {other:?}"),
     }
-    // 300 CJK chars = 900 bytes: over policy, stubbed with char count.
+    // 300 CJK chars = 900 bytes: over policy, offloaded with char count.
     let big_cjk = "\u{4e2d}".repeat(300);
     let two_big = vec![
         Message {
@@ -564,20 +641,140 @@ fn tool_result_clearing_counts_characters_not_bytes() {
         },
         messages[0].clone(),
     ];
-    let out = Agent::apply_tool_result_clearing(two_big);
+    let out = Agent::apply_tool_result_clearing(two_big, "session_cjk_test");
     match &out[0].content[0] {
         ContentBlock::ToolResult { content, .. } => assert!(
-            content.starts_with("[cleared by retention: was 300 chars]"),
+            content.starts_with("[offloaded by retention: was 300 chars;"),
             "got: {content}"
         ),
-        other => panic!("big CJK result must stub with char count, got: {other:?}"),
+        other => panic!("big CJK result must offload with char count, got: {other:?}"),
     }
 
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
     match prev {
         Some(value) => crate::env::set_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN", value),
         None => crate::env::remove_var("JCODE_COMPACTION_CLEAR_TOOL_RESULTS_OLDER_THAN"),
     }
     crate::config::Config::invalidate_cache();
+}
+
+#[test]
+fn tool_result_offload_falls_back_to_stub_when_unwritable() {
+    use crate::message::{ContentBlock, Message, Role};
+    // Offload must never break a send: block the session offload dir with a
+    // regular file (create_dir_all fails) and expect the lossy stub.
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let mut cfg = crate::config::Config::default();
+    cfg.compaction.clear_tool_results_older_than = Some(1);
+    cfg.save().expect("save config");
+    crate::config::Config::invalidate_cache();
+    let blocked = temp
+        .path()
+        .join("sessions")
+        .join("offloaded")
+        .join(Agent::sanitize_offload_component("session_failopen"));
+    std::fs::create_dir_all(blocked.parent().expect("parents")).expect("parents");
+    std::fs::write(&blocked, b"blocker").expect("blocker file");
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_blocked".to_string(),
+                content: "z".repeat(5000),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "recent".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+    let out = Agent::apply_tool_result_clearing(messages, "session_failopen");
+    match &out[0].content[0] {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => {
+            assert_eq!(tool_use_id, "call_blocked");
+            assert_eq!(content, "[cleared by retention: was 5000 chars]");
+        }
+        other => panic!("result block must survive with stub fallback, got: {other:?}"),
+    }
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    crate::config::Config::invalidate_cache();
+}
+
+#[test]
+fn tool_result_offload_sanitizes_adversarial_ids() {
+    use std::path::Path;
+    // Provider-issued ids reach the filesystem: traversal, separators, and
+    // dot-dots must fold to inert characters, and the result must join as a
+    // single component that cannot escape its parent.
+    for raw in [
+        "../../etc/evil",
+        "a/b\\c:d",
+        "..",
+        "call_123",
+        "session_fox_1234567890_deadbeefcafebabe",
+    ] {
+        let safe = Agent::sanitize_offload_component(raw);
+        assert!(
+            !safe.contains('/') && !safe.contains('\\') && !safe.contains(".."),
+            "unsafe survivor in {safe:?} from {raw:?}"
+        );
+        let base = Path::new("/base");
+        assert_eq!(
+            base.join(&safe).parent(),
+            Some(base),
+            "{safe:?} must append as one component"
+        );
+    }
+    // Distinct raw ids that sanitize alike must never share a file (hash
+    // suffix), and long ids are bounded (64 kept + _ + 8 hex).
+    let a = Agent::sanitize_offload_component("a/b");
+    let b = Agent::sanitize_offload_component("a:b");
+    assert_ne!(a, b, "hash suffix must disambiguate");
+    let long = Agent::sanitize_offload_component(&"a".repeat(200));
+    assert!(long.len() <= 64 + 1 + 8, "got len {}", long.len());
+}
+
+#[test]
+fn tool_result_offload_preview_first_lines_capped() {
+    // Deep Agents shape: first 10 lines stay oriented without the full cost.
+    let content = (1..=15)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let preview = Agent::offload_preview(&content);
+    assert_eq!(preview.lines().count(), 10);
+    assert!(preview.starts_with("line1\n"), "got: {preview}");
+    assert!(preview.ends_with("line10"), "got: {preview}");
+    // A single megablob line cannot blow the substitution budget.
+    let blob = "x".repeat(2000);
+    let preview = Agent::offload_preview(&blob);
+    assert_eq!(preview.chars().count(), 500 + "...(truncated)".len());
+    assert!(preview.ends_with("...(truncated)"), "got tail");
+    // Short content passes through untouched.
+    assert_eq!(Agent::offload_preview("a\nb"), "a\nb");
 }
 
 #[test]
