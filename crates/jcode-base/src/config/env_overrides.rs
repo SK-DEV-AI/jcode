@@ -532,9 +532,15 @@ impl Config {
             &mut self.hooks.compaction_emergency,
             "JCODE_HOOK_COMPACTION_EMERGENCY",
         );
+        hook_env_override(&mut self.hooks.pre_request, "JCODE_HOOK_PRE_REQUEST");
         if let Ok(v) = std::env::var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS") {
             if let Ok(parsed) = v.trim().parse::<u64>() {
                 self.hooks.pre_tool_timeout_ms = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_HOOK_PRE_REQUEST_TIMEOUT_MS") {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                self.hooks.pre_request_timeout_ms = parsed;
             }
         }
 
