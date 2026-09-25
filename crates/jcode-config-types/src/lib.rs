@@ -431,6 +431,13 @@ pub struct CompactionConfig {
     /// and why they were taken, unresolved bugs/errors, implementation
     /// paths still in flight, and system state (working dir, branch, active
     /// plan). Merge, don't replace, any `existing_summary` in the request.
+    /// Recommended shape for a custom prompt mirrors the built-in schema
+    /// (`SUMMARY_PROMPT` in `jcode-compaction-core`): task / current state /
+    /// decisions+rationale / discoveries (verified evidence) / failed attempts
+    /// (never omit — prevents retrying dead ends) / information gaps
+    /// (facts vs guesses separated) / blocked (with unblock conditions) /
+    /// next steps (priority-ordered) / relevant files (exact paths+symbols) /
+    /// verbatim user prefs and security constraints (word for word).
     pub summary_command: Option<String>,
     /// Max milliseconds to wait for the summary command before failing open
     /// to the built-in summarizer (default: 120000).
