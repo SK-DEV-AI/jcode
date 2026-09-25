@@ -811,7 +811,6 @@ impl Agent {
         messages
     }
 
-    fn messages_for_provider(&mut self) -> (Vec<Message>, Option<CompactionEvent>) {
     /// Usage fraction at which the advisory pressure notice fires.
     ///
     /// Evidence: benchmark consensus (2026) puts the *effective* context of
