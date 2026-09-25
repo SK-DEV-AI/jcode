@@ -897,3 +897,54 @@ fn prompt_guidance_missing_or_unreadable_project_keeps_global_content() {
         }
     });
 }
+
+#[test]
+fn progress_md_loads_after_instructions_with_state_label() {
+    // U4 historian-lite read-side: project PROGRESS.md joins the bootstrap
+    // snapshot AFTER instruction files, labeled as state. Model owns the
+    // write side; core only reads.
+    let project_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(project_dir.path().join("AGENTS.md"), "project instructions").unwrap();
+    std::fs::write(project_dir.path().join("PROGRESS.md"), "## Next: ship U4").unwrap();
+
+    let (content, info) = load_agents_md_files_from_dirs(project_dir.path(), None);
+    let content = content.expect("snapshot with progress");
+    assert!(info.has_project_agents_md);
+    assert!(info.has_project_progress_md);
+    assert!(!info.has_global_agents_md);
+    assert_eq!(info.project_progress_md_chars, "## Next: ship U4".len());
+    assert!(content.contains("# Project Instructions (AGENTS.md)"));
+    assert!(content.contains("# Project Progress (PROGRESS.md)"));
+    assert!(content.contains("## Next: ship U4"));
+    // State, not instructions: ordered after.
+    assert!(
+        content.find("AGENTS.md)").unwrap() < content.find("PROGRESS.md)").unwrap(),
+        "progress must load after instruction files"
+    );
+}
+
+#[test]
+fn progress_md_absent_is_byte_identical() {
+    // Off by absence: projects without the file see zero behavior change.
+    let project_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(project_dir.path().join("AGENTS.md"), "project instructions").unwrap();
+
+    let (content, info) = load_agents_md_files_from_dirs(project_dir.path(), None);
+    let content = content.expect("snapshot without progress");
+    assert!(info.has_project_agents_md);
+    assert!(!info.has_project_progress_md);
+    assert_eq!(info.project_progress_md_chars, 0);
+    assert!(!content.contains("PROGRESS.md"));
+    assert!(content.contains("project instructions"));
+}
+
+#[test]
+fn progress_md_counts_in_prefix_accounting() {
+    // Token-pressure math must see the progress bytes.
+    let project_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(project_dir.path().join("PROGRESS.md"), "state-bytes").unwrap();
+
+    let (_, info) = load_agents_md_files_from_dirs(project_dir.path(), None);
+    assert!(info.has_project_progress_md);
+    assert!(info.prompt_prefix_chars() >= "state-bytes".len());
+}

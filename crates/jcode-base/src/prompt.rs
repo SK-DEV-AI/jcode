@@ -292,6 +292,11 @@ pub struct ContextInfo {
     pub has_project_agents_md: bool,
     /// Project AGENTS.md size (chars)
     pub project_agents_md_chars: usize,
+    /// Whether project PROGRESS.md was loaded (cross-session state, not
+    /// instructions — ordered after instruction files in the snapshot)
+    pub has_project_progress_md: bool,
+    /// Project PROGRESS.md size (chars)
+    pub project_progress_md_chars: usize,
     /// Whether global ~/AGENTS.md was loaded
     pub has_global_agents_md: bool,
     /// Global AGENTS.md size (chars)
@@ -342,6 +347,7 @@ impl ContextInfo {
         self.system_prompt_chars
             + self.session_context_chars
             + self.project_agents_md_chars
+            + self.project_progress_md_chars
             + self.global_agents_md_chars
             + self.skills_chars
             + self.selfdev_chars
@@ -987,6 +993,19 @@ fn load_agents_md_files_from_dirs(
     {
         info.has_global_agents_md = true;
         info.global_agents_md_chars = size;
+        contents.push(content);
+    }
+
+    // Cross-session progress state (U4 historian-lite). Project-dir only by
+    // design — progress belongs to one project, never global. State, not
+    // instructions: loads AFTER the instruction files. Off by absence: no
+    // file means no bytes and no behavior change. The model owns the write
+    // side (updates via edit at milestones + session end); core only reads.
+    let project_progress_md = project_dir.join("PROGRESS.md");
+    if let Some((content, size)) = load_file(&project_progress_md, "Project Progress (PROGRESS.md)")
+    {
+        info.has_project_progress_md = true;
+        info.project_progress_md_chars = size;
         contents.push(content);
     }
 
