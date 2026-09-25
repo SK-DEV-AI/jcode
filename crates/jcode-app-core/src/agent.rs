@@ -41,6 +41,7 @@ use crate::skill::SkillRegistry;
 use crate::tool::{Registry, ToolContext, ToolExecutionMode};
 use anyhow::Result;
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
@@ -749,13 +750,101 @@ impl Agent {
     /// nothing and only adds noise.
     const TOOL_RESULT_CLEAR_MIN_CHARS: usize = 200;
 
+    /// Preview lines substituted into the send view for an offloaded result
+    /// (LangChain Deep Agents shape: path reference + first-N-lines preview;
+    /// the model re-reads the file with existing tools when it needs more).
+    const TOOL_RESULT_OFFLOAD_PREVIEW_LINES: usize = 10;
+    /// Hard cap on the substituted preview so the substitution itself never
+    /// becomes a context hog on single-line-megablob outputs.
+    const TOOL_RESULT_OFFLOAD_PREVIEW_MAX_CHARS: usize = 500;
+
+    /// Sanitize an id for use as a single path component: keep
+    /// `[A-Za-z0-9-_]`, fold anything else to `_`, truncate, and suffix 8 hex
+    /// of SHA-256 over the raw id so distinct raw ids that sanitize alike
+    /// never share a file. Both ids reaching here are provider- or
+    /// control-plane-influenced strings, never trust them as paths directly.
+    pub(crate) fn sanitize_offload_component(raw: &str) -> String {
+        const KEEP: usize = 64;
+        let kept: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(KEEP)
+            .collect();
+        let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        format!("{kept}_{}", &hash[..8])
+    }
+
+    /// First-N-lines preview of an offloaded result, capped at
+    /// `TOOL_RESULT_OFFLOAD_PREVIEW_MAX_CHARS` so a 10-line wall of minified
+    /// JSON still cannot blow the substitution budget.
+    pub(crate) fn offload_preview(content: &str) -> String {
+        let first = content
+            .lines()
+            .take(Self::TOOL_RESULT_OFFLOAD_PREVIEW_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if first.chars().count() > Self::TOOL_RESULT_OFFLOAD_PREVIEW_MAX_CHARS {
+            let truncated: String = first
+                .chars()
+                .take(Self::TOOL_RESULT_OFFLOAD_PREVIEW_MAX_CHARS)
+                .collect();
+            format!("{truncated}...(truncated)")
+        } else {
+            first
+        }
+    }
+
+    /// Write a cleared tool result to its session-scoped offload file
+    /// (`<jcode_dir>/sessions/offloaded/<session>/<tool>_<hash>.txt`), full
+    /// original bytes under a small deterministic header (no timestamps, so
+    /// rewrites are byte-identical). Returns the absolute path plus the
+    /// preview for the send-view substitution, or `None` on any I/O failure —
+    /// the caller falls back to the lossy stub, so offload can never break a
+    /// send.
+    fn offload_tool_result(
+        session_id: &str,
+        tool_use_id: &str,
+        tool_name: Option<&str>,
+        content: &str,
+    ) -> Option<(PathBuf, String)> {
+        let dir = crate::storage::jcode_dir()
+            .ok()?
+            .join("sessions")
+            .join("offloaded")
+            .join(Self::sanitize_offload_component(session_id));
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!(
+            "{}.txt",
+            Self::sanitize_offload_component(tool_use_id)
+        ));
+        let was = content.chars().count();
+        let body = format!(
+            "# jcode offloaded tool result\nsession: {session_id}\ntool_use_id: {tool_use_id}\ntool: {}\nchars: {was}\n--- result ---\n{content}",
+            tool_name.unwrap_or("unknown"),
+        );
+        std::fs::write(&path, body).ok()?;
+        Some((path, Self::offload_preview(content)))
+    }
+
     /// Proactive tool-result clearing (Anthropic `clear_tool_uses` primitive,
-    /// deterministic edition). Stubs the content of tool results older than
-    /// the configured window, keeping ToolUse blocks and result IDs intact
-    /// so provider tool-pairing never breaks. Operates on the send view
+    /// deterministic edition). Results older than the configured window are
+    /// offloaded to a session-scoped file with a path + preview substitution
+    /// (Deep Agents tier-1: recoverable beats unrecoverable); when the offload
+    /// write fails, falls back to the lossy `[cleared by retention]` stub.
+    /// ToolUse blocks (name + input) and result IDs are always kept, so
+    /// provider tool-pairing never breaks. Operates on the send view
     /// only — the session file keeps the full history for later compaction.
     /// Off when unconfigured: input returns unchanged.
-    pub(crate) fn apply_tool_result_clearing(messages: Vec<Message>) -> Vec<Message> {
+    pub(crate) fn apply_tool_result_clearing(
+        messages: Vec<Message>,
+        session_id: &str,
+    ) -> Vec<Message> {
         let keep = match crate::config::config()
             .compaction
             .clear_tool_results_older_than
@@ -768,6 +857,17 @@ impl Agent {
         }
         let mut messages = messages;
         let cutoff = messages.len() - keep;
+        // Tool names live on the ToolUse blocks, not the results: correlate
+        // once (owned — the borrow cannot survive the mutation loop below) so
+        // offloaded files carry the originating tool name in their header.
+        let mut tool_names: HashMap<String, String> = HashMap::new();
+        for message in messages.iter() {
+            for block in message.content.iter() {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    tool_names.entry(id.clone()).or_insert_with(|| name.clone());
+                }
+            }
+        }
         for message in messages.iter_mut().take(cutoff) {
             // Tool-returned images ride in the same message as the ToolResult
             // (tool_output_to_content_blocks) as base64, often 100KB-1MB each:
@@ -797,14 +897,32 @@ impl Agent {
                 }
             }
             for block in message.content.iter_mut() {
-                if let ContentBlock::ToolResult { content, .. } = block
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
                     // Character count, not byte length: a 100-CJK-char result
                     // is 300 bytes but reads as 100 chars of context.
                     && content.chars().count() > Self::TOOL_RESULT_CLEAR_MIN_CHARS
                     && !content.starts_with("[cleared by retention")
+                    && !content.starts_with("[offloaded by retention")
                 {
                     let was = content.chars().count();
-                    *content = format!("[cleared by retention: was {was} chars]");
+                    let tool_name = tool_names.get(tool_use_id).map(String::as_str);
+                    match Self::offload_tool_result(session_id, tool_use_id, tool_name, content) {
+                        Some((path, preview)) => {
+                            *content = format!(
+                                "[offloaded by retention: was {was} chars; full result at {}; first lines:\n{preview}]",
+                                path.display()
+                            );
+                        }
+                        // Fail open: an unwritable offload dir (read-only
+                        // home, full disk) must never break a send.
+                        None => {
+                            *content = format!("[cleared by retention: was {was} chars]");
+                        }
+                    }
                 }
             }
         }
@@ -1011,7 +1129,10 @@ impl Agent {
                         user_count,
                         assistant_count,
                     ));
-                    return (Self::apply_tool_result_clearing(messages), event);
+                    return (
+                        Self::apply_tool_result_clearing(messages, &self.session.id),
+                        event,
+                    );
                 }
                 Err(_) => {
                     logging::info("messages_for_provider: compaction lock failed, using session");
@@ -1032,7 +1153,10 @@ impl Agent {
             user_count,
             assistant_count,
         ));
-        (Self::apply_tool_result_clearing(messages), None)
+        (
+            Self::apply_tool_result_clearing(messages, &self.session.id),
+            None,
+        )
     }
 
     fn record_client_cache_request(&mut self, messages: &[Message]) {
