@@ -17,7 +17,8 @@ git checkout -q -b local/pr-stack origin/master
 
 for b in feat/compaction-hooks feat/tool-result-clearing feat/pressure-notices \
          feat/pre-request-transform feat/recurring-schedules feat/span-citations \
-         feat/tunable-dedup-rrf feat/repomap-provider feat/memory-age-hedge; do
+         feat/tunable-dedup-rrf feat/repomap-provider feat/memory-age-hedge \
+         feat/offload-with-ref; do
   # NOTE: append every new feature branch here, or the next rebuild drops it.
   echo "=== merge $b ==="
   if ! git merge --no-edit "$b"; then
